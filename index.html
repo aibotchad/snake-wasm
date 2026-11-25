@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Snake — C → WebAssembly</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: radial-gradient(1200px 700px at 50% -10%, #1a2033 0%, #10131c 60%);
+    color: #e8ecf4;
+    font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    display: flex; align-items: center; justify-content: center;
+    touch-action: none;
+  }
+  .wrap { display: flex; flex-direction: column; gap: 14px; align-items: center; padding: 16px; }
+  .hud { display: flex; gap: 22px; align-items: baseline; }
+  .hud .score { font-size: 26px; font-weight: 700; color: #3de07a; }
+  .hud .best  { font-size: 15px; color: #8a93a8; }
+  .stage { position: relative; }
+  canvas {
+    display: block;
+    width: min(72vmin, 504px); height: min(72vmin, 504px);
+    border-radius: 10px;
+    box-shadow: 0 20px 60px rgba(0,0,0,.55), 0 0 0 1px rgba(255,255,255,.06);
+  }
+  .overlay {
+    position: absolute; inset: 0; border-radius: 10px;
+    display: flex; flex-direction: column; gap: 10px;
+    align-items: center; justify-content: center;
+    background: rgba(10,12,18,.72); backdrop-filter: blur(3px);
+    opacity: 0; pointer-events: none; transition: opacity .18s ease;
+  }
+  .overlay.show { opacity: 1; pointer-events: auto; }
+  .overlay h1 { font-size: 30px; letter-spacing: 2px; }
+  .overlay h1.dead { color: #ff4d6d; }
+  .overlay p { color: #aeb6c9; font-size: 14px; }
+  .overlay .final { font-size: 18px; color: #e8ecf4; }
+  button {
+    font: inherit; font-weight: 700; color: #0c1017; background: #3de07a;
+    border: 0; border-radius: 8px; padding: 10px 26px; cursor: pointer;
+  }
+  button:hover { filter: brightness(1.08); }
+  .hint { color: #6d7689; font-size: 12.5px; text-align: center; }
+  .badge { font-size: 11px; color: #6d7689; letter-spacing: 1px; }
+  .badge b { color: #8a93a8; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hud">
+    <span class="score" id="score">0</span>
+    <span class="best" id="best"></span>
+  </div>
+  <div class="stage">
+    <canvas id="game"></canvas>
+    <div class="overlay show" id="overlay">
+      <h1 id="ov-title">SNAKE</h1>
+      <p id="ov-msg">C → WebAssembly · classic snake</p>
+      <p class="final" id="ov-final"></p>
+      <button id="ov-btn">Start</button>
+    </div>
+  </div>
+  <div class="hint">WASD / arrow keys to steer · swipe on touch · 180° turns are ignored</div>
+  <div class="badge"><b>emscripten</b> · C core · ~2.4 KB wasm</div>
+</div>
+
+<script src="snake.js"></script>
+<script>
+"use strict";
+const canvas  = document.getElementById("game");
+const ctx     = canvas.getContext("2d");
+const scoreEl = document.getElementById("score");
+const bestEl  = document.getElementById("best");
+const overlay = document.getElementById("overlay");
+const oTitle  = document.getElementById("ov-title");
+const oMsg    = document.getElementById("ov-msg");
+const oFinal  = document.getElementById("ov-final");
+const oBtn    = document.getElementById("ov-btn");
+
+const KEYMAP = { KeyW:0, ArrowUp:0, KeyD:1, ArrowRight:1, KeyS:2, ArrowDown:2, KeyA:3, ArrowLeft:3 };
+
+let M = null, W = 0, H = 0, buf = 0, imgData = null;
+let running = false, alive = true, score = 0;
+let best = +(localStorage.getItem("snake_wasm_best") || 0);
+
+function blit() {
+  // Re-read M.HEAPU8 every frame: with ALLOW_MEMORY_GROWTH the underlying
+  // ArrayBuffer can be replaced, so the heap view must never be cached.
+  const heap = M.HEAPU8;
+  const off = buf;
+  const d = imgData.data;
+  let i = 0;
+  for (; i < W * H; i++) { const j = off + i * 4; d[i*4] = heap[j]; d[i*4+1] = heap[j+1]; d[i*4+2] = heap[j+2]; d[i*4+3] = heap[j+3]; } // alpha too — ImageData starts at 0 and putImageData premultiplies
+  ctx.putImageData(imgData, 0, 0);
+}
+
+function syncHud() {
+  scoreEl.textContent = score;
+  bestEl.textContent = best > 0 ? "best " + best : "";
+}
+
+function showOverlay(title, dead, msg, final, btnLabel) {
+  oTitle.textContent = title;
+  oTitle.classList.toggle("dead", !!dead);
+  oMsg.textContent = msg;
+  oFinal.textContent = final || "";
+  oBtn.textContent = btnLabel;
+  overlay.classList.add("show");
+}
+
+function start() {
+  M._init_snake();
+  running = true; alive = true; score = 0;
+  M._frame(performance.now());
+  blit();
+  syncHud();
+  overlay.classList.remove("show");
+}
+
+function endGame() {
+  running = false;
+  const isBest = score > 0 && score >= best;
+  setTimeout(() => {
+    if (running) return;                 // guard: player already restarted
+    showOverlay("GAME OVER", true, "you hit a wall or yourself",
+      "score " + score + (isBest ? "  ·  new best!" : ""), "Play again");
+  }, 350);
+}
+
+let raf = null, lastStep = 0, hiddenAt = null;
+function step() {
+  const now = performance.now();
+  if (now - lastStep < 8) return;               // rAF + timer may overlap; C is timestamp-driven
+  lastStep = now;
+  M._frame(now);
+  if (M._get_alive() !== alive || M._get_score() !== score) {
+    alive = M._get_alive();
+    score = M._get_score();
+    if (score > best) { best = score; localStorage.setItem("snake_wasm_best", String(best)); }
+    syncHud();
+  }
+  if (!alive && running) endGame();
+  blit();
+}
+function loop() { raf = requestAnimationFrame(loop); step(); }
+setInterval(step, 50);                          // keeps the game alive when rAF is starved (background tabs, some headless drivers)
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { hiddenAt = performance.now(); }
+  else if (hiddenAt !== null) { M._frame(hiddenAt); lastStep = 0; blit(); hiddenAt = null; }  // resume with zero catch-up
+});
+
+oBtn.addEventListener("click", () => start());
+window.addEventListener("keydown", (e) => {
+  if (!M) return;
+  const d = KEYMAP[e.code];
+  if (d === undefined) return;
+  e.preventDefault();
+  M._set_dir(d);
+}, { passive: false });
+
+// touch swipe → direction
+let touchStart = null;
+canvas.addEventListener("touchstart", (e) => {
+  if (e.touches.length === 1) touchStart = [e.touches[0].clientX, e.touches[0].clientY];
+}, { passive: true });
+canvas.addEventListener("touchend", (e) => {
+  if (!touchStart) return;
+  const t = e.changedTouches[0];
+  const dx = t.clientX - touchStart[0], dy = t.clientY - touchStart[1];
+  if (Math.abs(dx) > 18 || Math.abs(dy) > 18) {
+    M._set_dir(Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 1 : 3) : (dy > 0 ? 2 : 0));
+  }
+  touchStart = null;
+}, { passive: true });
+
+(async () => {
+  try {
+    M = await createSnake({});          // MODULARIZE=1 factory, named via EXPORT_NAME
+  } catch (err) {
+    oMsg.textContent = "failed to load wasm: " + err;
+    return;
+  }
+  W = M._snake_w(); H = M._snake_h(); buf = M._snake_buf();
+  canvas.width = W; canvas.height = H;
+  imgData = new ImageData(W, H);        // standalone array (V8 rejects heap sub-views)
+  M._init_snake();
+  M._frame(performance.now());
+  blit();
+  syncHud();
+  showOverlay("SNAKE", false, "C → WebAssembly · classic snake", "", "Start");
+  loop();
+})();
+</script>
+</body>
+</html>
