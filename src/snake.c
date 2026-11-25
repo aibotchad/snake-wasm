@@ -129,6 +129,7 @@ static void tick(void) {
 
 static void build_occ(void) {
     int i;
+    memset(occ, 0, sizeof occ);      /* clear stale cells so vacated tail/track doesn't ghost */
     for (i = 0; i < len; i++) occ[snake_x[i]][snake_y[i]] = 1;
     occ[snake_x[0]][snake_y[0]] = 2;
     occ[food_x][food_y] = 3;
